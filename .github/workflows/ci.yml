@@ -1,0 +1,73 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  lint:
+    name: pint and phpstan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          coverage: none
+      - run: composer update --no-interaction --no-progress --prefer-dist
+      - run: vendor/bin/pint --test
+      - run: vendor/bin/phpstan analyse --memory-limit=1G --no-progress
+
+  test:
+    name: pest (php ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 8.2 resolves Laravel 12 and Pest 3; 8.3 and later resolve Laravel 13 and Pest 4.
+        php: ["8.2", "8.3", "8.4"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: mbstring, zlib
+          coverage: none
+      - run: composer update --no-interaction --no-progress --prefer-dist
+      - run: vendor/bin/pest --testsuite=Unit,Laravel
+
+  conformance:
+    name: sdk-spec conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          coverage: none
+      - run: composer update --no-interaction --no-progress --prefer-dist
+      - name: mock server at the spec version this SDK declares
+        run: |
+          SPEC=$(php -r 'echo json_decode(file_get_contents("composer.json"))->extra->ipase->spec;')
+          IMAGE="ghcr.io/ipase-hq/sdk-spec/mock-server:$SPEC"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker pull "$IMAGE"
+          docker run -d --rm -p 8787:8787 --name mock "$IMAGE"
+          # The fixtures come from the same image, so they always match the server's verdicts.
+          docker cp mock:/app/fixtures tests/Conformance/.fixtures
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8787/__health; then echo; break; fi
+            sleep 1
+          done
+      - run: composer conformance
+        env:
+          MOCK_SERVER_URL: http://127.0.0.1:8787
+          FIXTURES_DIR: tests/Conformance/.fixtures
+      - name: mock server log
+        if: failure()
+        run: docker logs mock
